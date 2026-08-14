@@ -256,10 +256,19 @@ func makeAsyncRequest(ctx context.Context, stepCtx *model.StepContext, httpClien
 }
 func proxy(ctx *model.StepContext, r *http.Request, w http.ResponseWriter, httpClient *http.Client) {
 	target := ctx.Route.URL
-	r.Header.Set("X-Forwarded-Host", r.Host)
 	director := func(req *http.Request) {
 		req.URL = target
 		req.Host = target.Host
+		// Re-originate the outbound request with a controlled header set rather than
+		// forwarding the caller's headers verbatim. This handler acts as a signing
+		// protocol gateway to arbitrary NP infrastructure, not a transparent proxy:
+		// forwarded caller headers (Accept-Encoding, Cookie, User-Agent, CF-*, etc.)
+		// can make heterogeneous upstreams respond in non-ONDC ways — e.g. a VS Code
+		// dev tunnel answering with a 308 anti-phishing redirect instead of the app's
+		// ACK, which then gets streamed back as an empty/invalid response. Only the
+		// signature and content negotiation headers are preserved; the body (and thus
+		// the signature computed over it) is untouched.
+		req.Header = sanitizedProxyHeader(req.Header)
 
 		log.Request(req.Context(), req, ctx.Body)
 	}
@@ -270,6 +279,29 @@ func proxy(ctx *model.StepContext, r *http.Request, w http.ResponseWriter, httpC
 	}
 
 	proxy.ServeHTTP(w, r)
+}
+
+// sanitizedProxyHeader returns a minimal header set for the outbound NP request,
+// preserving only the ONDC signature (subscriber or gateway) and content
+// negotiation headers. Everything else the caller sent is intentionally dropped so
+// no caller-supplied header can influence how an arbitrary NP upstream responds.
+// Accept-Encoding is deliberately omitted so the transport's transparent
+// decompression stays enabled.
+func sanitizedProxyHeader(in http.Header) http.Header {
+	out := http.Header{}
+	if v := in.Get(model.AuthHeaderSubscriber); v != "" {
+		out.Set(model.AuthHeaderSubscriber, v)
+	}
+	if v := in.Get(model.AuthHeaderGateway); v != "" {
+		out.Set(model.AuthHeaderGateway, v)
+	}
+	if v := in.Get("Content-Type"); v != "" {
+		out.Set("Content-Type", v)
+	} else {
+		out.Set("Content-Type", "application/json")
+	}
+	out.Set("Accept", "application/json")
+	return out
 }
 
 // loadPlugin is a generic function to load and validate plugins.
