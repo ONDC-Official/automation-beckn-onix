@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/beckn-one/beckn-onix/pkg/model"
 )
@@ -80,5 +81,66 @@ func TestMakeAsyncRequest_NoSignatureHeaders(t *testing.T) {
 		if _, ok := got[http.CanonicalHeaderKey(h)]; ok {
 			t.Errorf("unexpected %s header on unsigned request: %q", h, got.Get(h))
 		}
+	}
+}
+
+type asyncTestCtxKey struct{}
+
+// ctxValueTransport records a value from the outbound request's context, so the
+// test can check that values (trace ids, logger fields) still flow through.
+type ctxValueTransport struct {
+	base http.RoundTripper
+	seen any
+}
+
+func (c *ctxValueTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.seen = r.Context().Value(asyncTestCtxKey{})
+	return c.base.RoundTrip(r)
+}
+
+// TestMakeAsyncRequest_SurvivesInboundCancel checks that the outbound call
+// finishes even when the inbound request's context is canceled while the
+// receiver is still working. The inbound context is canceled as soon as the
+// caller's connection closes, which happens long before a slow receiver answers.
+func TestMakeAsyncRequest_SurvivesInboundCancel(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		<-release // a slow receiver, still working after the caller is gone
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"message":{"ack":{"status":"ACK"}}}`))
+	}))
+	defer receiver.Close()
+
+	inbound, cancel := context.WithCancel(context.WithValue(context.Background(), asyncTestCtxKey{}, "trace-123"))
+	defer cancel()
+	stepCtx := newAsyncStepCtx(t, inbound, receiver.URL, []byte(`{}`))
+
+	transport := &ctxValueTransport{base: receiver.Client().Transport}
+	client := &http.Client{Transport: transport}
+
+	done := make(chan error, 1)
+	go func() { done <- makeAsyncRequest(stepCtx, stepCtx, client) }()
+
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request never reached the receiver")
+	}
+	cancel() // the caller hangs up
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("outbound call was cut off by the inbound cancel: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("makeAsyncRequest did not return")
+	}
+	if transport.seen != "trace-123" {
+		t.Errorf("context values not kept on the outbound request, got %v", transport.seen)
 	}
 }

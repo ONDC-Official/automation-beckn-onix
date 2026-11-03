@@ -232,7 +232,12 @@ func route(ctx *model.StepContext, r *http.Request, w http.ResponseWriter, pb de
 func makeAsyncRequest(ctx context.Context, stepCtx *model.StepContext, httpClient *http.Client) error {
 	target := stepCtx.Route.URL
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(stepCtx.Body))
+	// The inbound request's context is canceled as soon as the caller's
+	// connection closes, which can happen while a slow receiver is still
+	// working. Detach from that cancel so the call can finish, but keep the
+	// context values (trace and log fields). The HTTP client's timeouts still
+	// bound the call.
+	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodPost, target.String(), bytes.NewReader(stepCtx.Body))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
