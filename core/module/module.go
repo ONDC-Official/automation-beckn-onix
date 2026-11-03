@@ -1,9 +1,11 @@
 package module
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/beckn-one/beckn-onix/core/module/handler"
 	"github.com/beckn-one/beckn-onix/pkg/log"
@@ -85,18 +87,35 @@ func moduleCtxMiddleware(moduleName string, next http.Handler) http.Handler {
 	})
 }
 
+// PostResponseMiddleware runs the hooks added with handler.RegisterPostResponseHook
+// after the response has been sent to the caller.
 func PostResponseMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var hooks []handler.PostResponseHook
 
+			// The request context is canceled when the caller hangs up. That should
+			// still stop the handler while it is working, but it must not stop the
+			// hooks, which run after the caller already has its response. So the
+			// handler gets a context that follows the caller only until it returns.
+			ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+			defer cancel()
+			stopFollowingCaller := context.AfterFunc(r.Context(), cancel)
+
 			// store hook list pointer in request context
-			ctx := context.WithValue(r.Context(), handler.PostResponseKey{}, &hooks)
+			ctx = context.WithValue(ctx, handler.PostResponseKey{}, &hooks)
 			r = r.WithContext(ctx)
 
-			next.ServeHTTP(w, r)
+			pw := &postResponseWriter{ResponseWriter: w, hooks: &hooks}
+			next.ServeHTTP(pw, r)
+			stopFollowingCaller()
 
-			// 🔥 EXTREME LAST POINT 🔥
+			if len(hooks) == 0 {
+				return
+			}
+			// Send the response now, so the caller does not wait for the hooks.
+			pw.send()
+
 			for _, hook := range hooks {
 				func() {
 					defer func() {
@@ -109,4 +128,76 @@ func PostResponseMiddleware() func(http.Handler) http.Handler {
 			}
 		})
 	}
+}
+
+// postResponseWriter holds back a response that is written after a hook was
+// registered, so it can be sent complete (with Content-Length) before the hooks
+// run. Without this the response stays in the server's buffer until the hooks
+// finish. Responses written with no hook registered, such as proxy responses,
+// pass straight through.
+type postResponseWriter struct {
+	http.ResponseWriter
+	hooks     *[]handler.PostResponseHook
+	decided   bool
+	buffering bool
+	status    int
+	buf       bytes.Buffer
+}
+
+func (w *postResponseWriter) decide() {
+	if !w.decided {
+		w.decided = true
+		w.buffering = len(*w.hooks) > 0
+	}
+}
+
+func (w *postResponseWriter) WriteHeader(code int) {
+	w.decide()
+	if !w.buffering {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+	if w.status == 0 {
+		w.status = code
+	}
+}
+
+func (w *postResponseWriter) Write(p []byte) (int, error) {
+	w.decide()
+	if !w.buffering {
+		return w.ResponseWriter.Write(p)
+	}
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.buf.Write(p)
+}
+
+// Flush passes through, except while a response is being held back.
+func (w *postResponseWriter) Flush() {
+	w.decide()
+	if !w.buffering {
+		_ = http.NewResponseController(w.ResponseWriter).Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (w *postResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// send writes out a held back response and pushes it to the caller.
+func (w *postResponseWriter) send() {
+	if w.buffering {
+		h := w.ResponseWriter.Header()
+		if h.Get("Content-Length") == "" {
+			h.Set("Content-Length", strconv.Itoa(w.buf.Len()))
+		}
+		// The connection stays busy until the hooks finish. Ask the caller not to
+		// reuse it, so its next request does not wait behind the hooks.
+		h.Set("Connection", "close")
+		w.ResponseWriter.WriteHeader(w.status)
+		_, _ = w.ResponseWriter.Write(w.buf.Bytes())
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }
