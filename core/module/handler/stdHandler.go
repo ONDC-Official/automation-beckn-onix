@@ -241,6 +241,14 @@ func makeAsyncRequest(ctx context.Context, stepCtx *model.StepContext, httpClien
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-Host", stepCtx.Route.URL.Host)
 
+	// Carry over the signature set by the sign step. Without it the receiver
+	// gets an unsigned request and rejects it.
+	for _, h := range []string{model.AuthHeaderSubscriber, model.AuthHeaderGateway} {
+		if v := stepCtx.Request.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+
 	log.Request(ctx, req, stepCtx.Body)
 
 	resp, err := httpClient.Do(req)
